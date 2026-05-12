@@ -37,10 +37,10 @@ enum SessionState: Comparable, Codable {
 
     var emoji: String {
         switch self {
-        case .active: "\u{26A1}"
-        case .waiting: "\u{23F3}"
-        case .idle: "\u{1F4A4}"
-        case .compacting: "\u{1F9F9}"
+        case .active: "\u{26A1}"        // ⚡
+        case .waiting: "\u{2753}"       // ❓ — clearly "needs you"
+        case .idle: "\u{1F4A4}"         // 💤
+        case .compacting: "\u{1F9F9}"   // 🧹
         }
     }
 
@@ -106,6 +106,13 @@ enum SessionSource: Codable, Equatable {
     }
 }
 
+/// A piece of text extracted from the JSONL transcript (action snippet or
+/// recap), paired with the entry's timestamp so callers can compare freshness.
+struct TranscriptSummary: Codable, Equatable {
+    let text: String
+    let timestamp: Date
+}
+
 /// A discovered Claude Code session on the local machine.
 struct ClaudeSession: Identifiable, Codable, Equatable {
     /// The session UUID from Claude Code (stable across refreshes).
@@ -126,6 +133,16 @@ struct ClaudeSession: Identifiable, Codable, Equatable {
     let activity: String
     /// Optional custom session name set by the user via /name-session.
     let sessionName: String?
+    /// ID of the `ClaudeProfile` whose config dir this session lives under.
+    /// Nil only for legacy / single-profile installs.
+    let profileId: String?
+    /// One-line summary of what's currently happening in the session, derived
+    /// from the latest assistant turn in the JSONL transcript (e.g.
+    /// "Bash: cargo build", "Read SettingsView.swift"). Nil when unavailable.
+    let lastAction: TranscriptSummary?
+    /// Most recent `away_summary` recap (Goal / Current task / Next) from the
+    /// session's transcript. Nil for sessions that never wrote one.
+    let recapIntent: TranscriptSummary?
 
     /// Use sessionId as the SwiftUI identity (stable, unlike PIDs).
     var id: String { sessionId }

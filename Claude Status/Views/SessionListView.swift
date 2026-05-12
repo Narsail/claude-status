@@ -1,12 +1,26 @@
 import SwiftUI
 
+/// Where the session list is being rendered. Controls layout: the popover is
+/// fixed-width and capped in height, the standalone window expands to fill its
+/// container and lets the user resize freely.
+enum SessionListPresentation {
+    case popover
+    case window
+}
+
 /// The popover content showing all active Claude Code sessions.
 struct SessionListView: View {
     let sessions: [ClaudeSession]
     let productivityData: ProductivityData
+    /// Map of profileId → display name. When more than one entry is provided,
+    /// session rows render a small profile chip so users can tell rows from
+    /// different Claude config dirs apart.
+    var profileNames: [String: String] = [:]
+    var presentation: SessionListPresentation = .popover
     var onSessionTap: ((ClaudeSession) -> Void)?
     var onRefresh: (() -> Void)?
     var onSettings: (() -> Void)?
+    var onOpenWindow: (() -> Void)?
     var onQuit: (() -> Void)?
 
     @AppStorage("iconStyle", store: UserDefaults(suiteName: "group.com.poisonpenllc.Claude-Status"))
@@ -38,17 +52,13 @@ struct SessionListView: View {
                 sessionList
             }
 
-            if productivityData.today.totalSessionTime > 0 {
-                Divider()
-                    .padding(.vertical, 4)
-                productivitySection
-            }
-
             Divider()
                 .padding(.vertical, 4)
             menuSection
         }
-        .frame(width: 300)
+        .frame(width: presentation == .popover ? 300 : nil)
+        .frame(minWidth: presentation == .window ? 320 : nil,
+               minHeight: presentation == .window ? 240 : nil)
         .background(.background)
     }
 
@@ -113,39 +123,36 @@ struct SessionListView: View {
                     Button {
                         onSessionTap?(session)
                     } label: {
-                        SessionRowView(session: session, iconStyle: iconStyle)
+                        SessionRowView(
+                            session: session,
+                            iconStyle: iconStyle,
+                            profileLabel: profileLabel(for: session),
+                            presentation: presentation
+                        )
                     }
                     .buttonStyle(.plain)
                 }
             }
             .padding(.vertical, 4)
         }
-        .frame(maxHeight: maxSessionListHeight)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxHeight: presentation == .window ? .infinity : maxSessionListHeight)
+        .fixedSize(horizontal: false, vertical: presentation == .popover)
     }
 
-    private var productivitySection: some View {
-        let stats = productivityData.today
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("Claude Usage (Today)")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(stats.totalTimeFormatted) · Score \(stats.score)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-
-            // Stacked horizontal bar — hover shows floating legend tooltip
-            ProductivityBarView(stats: stats)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 4)
+    /// Returns the profile name to chip-display for `session`, or nil when only
+    /// one profile is configured (in which case the chip would be redundant).
+    private func profileLabel(for session: ClaudeSession) -> String? {
+        guard profileNames.count > 1, let id = session.profileId else { return nil }
+        return profileNames[id]
     }
 
     private var menuSection: some View {
         VStack(spacing: 0) {
+            if presentation == .popover, onOpenWindow != nil {
+                menuButton(action: { onOpenWindow?() }) {
+                    Text("Open Sessions Window")
+                }
+            }
             menuButton(action: { onQuit?() }) {
                 Text("Quit")
             }

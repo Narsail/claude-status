@@ -15,20 +15,25 @@ struct CStatusRecord {
     let fileURL: URL
     /// The encoded project directory name (parent of the .cstatus file).
     let projectDir: URL
+    /// ID of the profile (Claude config dir root) this record was found under.
+    let profileId: String?
 }
 
-/// Discovers Claude Code sessions by scanning `~/.claude/projects/` for `.cstatus` files
-/// and validating that the referenced processes are still alive.
+/// Discovers Claude Code sessions by scanning each configured profile's
+/// `<configDir>/projects/` directory for `.cstatus` files and validating
+/// that the referenced processes are still alive.
 struct SessionDiscovery {
 
     /// Sessions confirmed dead — skip on subsequent scans until invalidated.
     /// Keyed by session ID (UUID string from the .cstatus filename).
     var deadSessions: Set<String> = []
 
-    private static let claudeProjectsDir: URL = {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/projects")
-    }()
+    /// Profiles whose `projects/` directories will be scanned.
+    var profiles: [ClaudeProfile]
+
+    init(profiles: [ClaudeProfile] = []) {
+        self.profiles = profiles
+    }
 
     // MARK: - Discovery
 
@@ -69,7 +74,8 @@ struct SessionDiscovery {
             if deadSessions.contains(sessionId) {
                 continue
             }
-            guard let record = parseCStatusFile(at: url) else {
+            let profileId = profileIdForURL(url)
+            guard let record = parseCStatusFile(at: url, profileId: profileId) else {
                 deadSessions.insert(sessionId)
                 continue
             }
@@ -81,6 +87,17 @@ struct SessionDiscovery {
             cstatusFiles[record.sessionId] = record.fileURL
         }
         return DiscoveryResult(sessions: sessions, cstatusFiles: cstatusFiles)
+    }
+
+    /// Resolves which configured profile a `.cstatus` URL belongs to by prefix match.
+    private func profileIdForURL(_ url: URL) -> String? {
+        let path = url.path
+        for profile in profiles {
+            if path.hasPrefix(profile.projectsDirURL.path) {
+                return profile.id
+            }
+        }
+        return nil
     }
 
     /// Clears the dead session list (e.g. after a Darwin notification
@@ -96,35 +113,39 @@ struct SessionDiscovery {
 
     // MARK: - File Scanning
 
-    /// Enumerates all `.cstatus` files under `~/.claude/projects/*/`.
+    /// Enumerates all `.cstatus` files under every configured profile's
+    /// `<configDir>/projects/*/` directory.
     private func scanCStatusFiles() -> [CStatusRecord] {
         let fm = FileManager.default
-        let projectsDir = Self.claudeProjectsDir
-
-        guard let projectDirs = try? fm.contentsOfDirectory(
-            at: projectsDir,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: .skipsHiddenFiles
-        ) else {
-            return []
-        }
-
         var records: [CStatusRecord] = []
-        for dir in projectDirs {
-            guard let isDir = try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory,
-                  isDir else {
-                continue
-            }
-            guard let files = try? fm.contentsOfDirectory(
-                at: dir,
-                includingPropertiesForKeys: nil,
+
+        for profile in profiles {
+            let projectsDir = profile.projectsDirURL
+
+            guard let projectDirs = try? fm.contentsOfDirectory(
+                at: projectsDir,
+                includingPropertiesForKeys: [.isDirectoryKey],
                 options: .skipsHiddenFiles
             ) else {
                 continue
             }
-            for file in files where file.pathExtension == "cstatus" {
-                if let record = parseCStatusFile(at: file) {
-                    records.append(record)
+
+            for dir in projectDirs {
+                guard let isDir = try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory,
+                      isDir else {
+                    continue
+                }
+                guard let files = try? fm.contentsOfDirectory(
+                    at: dir,
+                    includingPropertiesForKeys: nil,
+                    options: .skipsHiddenFiles
+                ) else {
+                    continue
+                }
+                for file in files where file.pathExtension == "cstatus" {
+                    if let record = parseCStatusFile(at: file, profileId: profile.id) {
+                        records.append(record)
+                    }
                 }
             }
         }
@@ -132,7 +153,7 @@ struct SessionDiscovery {
     }
 
     /// Parses a single `.cstatus` JSON file.
-    private func parseCStatusFile(at url: URL) -> CStatusRecord? {
+    private func parseCStatusFile(at url: URL, profileId: String? = nil) -> CStatusRecord? {
         guard let data = try? Data(contentsOf: url),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let sessionId = json["session_id"] as? String,
@@ -171,7 +192,8 @@ struct SessionDiscovery {
             event: event,
             sessionName: sessionName,
             fileURL: url,
-            projectDir: url.deletingLastPathComponent()
+            projectDir: url.deletingLastPathComponent(),
+            profileId: profileId
         )
     }
 
@@ -221,9 +243,20 @@ struct SessionDiscovery {
             tmuxSocket: tmuxSocket,
             source: source,
             activity: record.activity,
-            sessionName: record.sessionName
+            sessionName: record.sessionName,
+            profileId: record.profileId,
+            lastAction: lastActionResolver?(record.sessionId, record.projectDir),
+            recapIntent: recapResolver?(record.sessionId, record.projectDir)
         )
     }
+
+    /// Closure used to extract a one-line action summary from the JSONL
+    /// transcript. Injected by `SessionMonitor` so this file stays free of
+    /// JSONL-parsing internals.
+    var lastActionResolver: ((String, URL) -> TranscriptSummary?)?
+    /// Closure that extracts the most recent auto-compaction recap. Same
+    /// reasoning as `lastActionResolver` — parsing lives in `StateResolver`.
+    var recapResolver: ((String, URL) -> TranscriptSummary?)?
 
     // MARK: - Process Validation
 

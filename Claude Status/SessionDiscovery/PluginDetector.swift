@@ -18,10 +18,22 @@ enum PluginInstallState {
 
 struct PluginDetector {
 
-    private static let claudeDir: URL = {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude")
-    }()
+    /// Config directory to check. Defaults to `~/.claude` for backwards compatibility.
+    let configDir: URL
+
+    init(configDir: URL? = nil) {
+        if let configDir {
+            self.configDir = configDir
+        } else {
+            self.configDir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".claude")
+        }
+    }
+
+    /// Convenience initializer that builds a detector for a given profile.
+    init(profile: ClaudeProfile) {
+        self.init(configDir: profile.configDirURL)
+    }
 
     /// Checks whether the session-status hook is available through any path.
     func detect() -> PluginInstallState {
@@ -32,19 +44,19 @@ struct PluginDetector {
             return .installed
         }
 
-        // If ~/.claude doesn't exist at all, we can't determine
+        // If the config directory doesn't exist at all, we can't determine
         let fm = FileManager.default
-        if !fm.fileExists(atPath: Self.claudeDir.path) {
+        if !fm.fileExists(atPath: configDir.path) {
             return .unknown
         }
 
         return .notInstalled
     }
 
-    /// Returns the installed plugin version from `~/.claude/plugins/installed_plugins.json`,
-    /// or nil if the plugin is not installed or the version can't be determined.
+    /// Returns the installed plugin version from the config dir's
+    /// `plugins/installed_plugins.json`, or nil if it can't be determined.
     func installedPluginVersion() -> String? {
-        let url = Self.claudeDir
+        let url = configDir
             .appendingPathComponent("plugins/installed_plugins.json")
 
         guard let data = try? Data(contentsOf: url),
@@ -70,7 +82,7 @@ struct PluginDetector {
     /// Looks for any plugin key containing "claude-status" in installed_plugins.json,
     /// and verifies it's enabled in settings.json.
     private func checkInstalledPlugins() -> Bool {
-        let url = Self.claudeDir
+        let url = configDir
             .appendingPathComponent("plugins/installed_plugins.json")
 
         guard let data = try? Data(contentsOf: url),
@@ -83,7 +95,7 @@ struct PluginDetector {
         guard installed else { return false }
 
         // Also verify it's enabled
-        let settingsURL = Self.claudeDir.appendingPathComponent("settings.json")
+        let settingsURL = configDir.appendingPathComponent("settings.json")
         guard let settingsData = try? Data(contentsOf: settingsURL),
               let settings = try? JSONSerialization.jsonObject(with: settingsData) as? [String: Any],
               let enabled = settings["enabledPlugins"] as? [String: Bool] else {
@@ -95,9 +107,9 @@ struct PluginDetector {
 
     // MARK: - Settings Hooks Check
 
-    /// Looks for session-status references in ~/.claude/settings.json hooks.
+    /// Looks for session-status references in `<configDir>/settings.json` hooks.
     private func checkSettingsHooks() -> Bool {
-        let url = Self.claudeDir
+        let url = configDir
             .appendingPathComponent("settings.json")
 
         guard let data = try? Data(contentsOf: url),

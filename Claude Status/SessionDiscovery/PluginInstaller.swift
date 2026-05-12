@@ -45,7 +45,9 @@ struct PluginInstaller {
     // MARK: - Install
 
     /// Installs the plugin via the Claude CLI. Returns nil on success, or an error message.
-    func install() -> String? {
+    /// When `profile` is non-nil and points at a non-default config dir, the CLI is invoked
+    /// with `CLAUDE_CONFIG_DIR` set so the plugin is installed into the right location.
+    func install(profile: ClaudeProfile? = nil) -> String? {
         guard let claude = claudePath else {
             return "Claude Code CLI not found. Install it first: https://docs.anthropic.com/en/docs/claude-code/overview"
         }
@@ -57,7 +59,7 @@ struct PluginInstaller {
         // 1. Add the marketplace
         let addResult = runCLI(claude, arguments: [
             "plugin", "marketplace", "add", marketplacePath,
-        ])
+        ], profile: profile)
         if let error = addResult {
             // Ignore "already exists" errors
             if !error.contains("already") {
@@ -68,7 +70,7 @@ struct PluginInstaller {
         // 2. Install the plugin
         let installResult = runCLI(claude, arguments: [
             "plugin", "install", Self.pluginKey,
-        ])
+        ], profile: profile)
         if let error = installResult {
             // Ignore "already installed" errors
             if !error.contains("already") {
@@ -82,7 +84,7 @@ struct PluginInstaller {
     // MARK: - Uninstall
 
     /// Uninstalls the plugin via the Claude CLI. Returns nil on success, or an error message.
-    func uninstall() -> String? {
+    func uninstall(profile: ClaudeProfile? = nil) -> String? {
         guard let claude = claudePath else {
             return "Claude Code CLI not found."
         }
@@ -90,7 +92,7 @@ struct PluginInstaller {
         // 1. Uninstall the plugin
         let uninstallResult = runCLI(claude, arguments: [
             "plugin", "uninstall", Self.pluginKey,
-        ])
+        ], profile: profile)
         if let error = uninstallResult {
             if !error.contains("not installed") && !error.contains("not found") {
                 return "Failed to uninstall plugin: \(error)"
@@ -100,7 +102,7 @@ struct PluginInstaller {
         // 2. Remove the marketplace
         let removeResult = runCLI(claude, arguments: [
             "plugin", "marketplace", "remove", Self.marketplaceName,
-        ])
+        ], profile: profile)
         if let error = removeResult {
             if !error.contains("not found") && !error.contains("not registered") {
                 return "Failed to remove marketplace: \(error)"
@@ -108,8 +110,10 @@ struct PluginInstaller {
         }
 
         // 3. Clear the plugin cache directory if it exists
-        let cacheDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/plugins/cache/\(Self.marketplaceName)/claude-status")
+        let cacheRoot = profile?.configDirURL
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+        let cacheDir = cacheRoot
+            .appendingPathComponent("plugins/cache/\(Self.marketplaceName)/claude-status")
         try? FileManager.default.removeItem(at: cacheDir)
 
         return nil
@@ -119,7 +123,7 @@ struct PluginInstaller {
 
     /// Runs a CLI command and returns nil on success, or the stderr/error on failure.
     /// Reads pipe output before waiting to prevent deadlock when pipe buffers fill.
-    private func runCLI(_ path: String, arguments: [String]) -> String? {
+    private func runCLI(_ path: String, arguments: [String], profile: ClaudeProfile? = nil) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -128,6 +132,10 @@ struct PluginInstaller {
         var env = ProcessInfo.processInfo.environment
         let homedir = FileManager.default.homeDirectoryForCurrentUser.path
         env["PATH"] = "\(homedir)/.local/bin:/usr/local/bin:/opt/homebrew/bin:" + (env["PATH"] ?? "")
+        // For non-default profiles, point the CLI at the right config dir.
+        if let profile, !profile.isDefaultLocation {
+            env["CLAUDE_CONFIG_DIR"] = profile.configDir
+        }
         process.environment = env
 
         let stderrPipe = Pipe()

@@ -33,7 +33,10 @@ nonisolated struct Claude_StatusTimelineProvider: TimelineProvider {
                 tmuxSocket: nil,
                 source: .terminal(app: "Terminal"),
                 activity: "Edit",
-                sessionName: nil
+                sessionName: nil,
+                profileId: nil,
+                lastAction: nil,
+                recapIntent: nil
             ),
             ClaudeSession(
                 sessionId: "placeholder-2",
@@ -47,7 +50,10 @@ nonisolated struct Claude_StatusTimelineProvider: TimelineProvider {
                 tmuxSocket: nil,
                 source: .vscode,
                 activity: "",
-                sessionName: nil
+                sessionName: nil,
+                profileId: nil,
+                lastAction: nil,
+                recapIntent: nil
             ),
         ])
     }

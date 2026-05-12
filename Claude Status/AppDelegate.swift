@@ -8,11 +8,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
-    private let monitor = SessionMonitor()
+    private let profileStore = ProfileStore()
+    private lazy var monitor = SessionMonitor(profileStore: profileStore)
     private let focuser = SessionFocuser()
     private let pluginInstaller = PluginInstaller()
+    private let notificationManager = NotificationManager.shared
     private var eventMonitor: Any?
     private var settingsWindow: NSWindow?
+    private lazy var sessionsWindow = SessionsWindowController(
+        monitor: monitor,
+        profileStore: profileStore,
+        onSessionTap: { [weak self] session in
+            self?.focuser.focus(session: session)
+        }
+    )
 
     /// Sparkle updater controller for automatic updates.
     /// Only initialized when a valid EdDSA public key is present in Info.plist.
@@ -37,7 +46,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         setupPopover()
         setupURLHandler()
+        setupNotifications()
         monitor.start()
+        sessionsWindow.restoreIfPreviouslyOpen()
 
         // Initialize Sparkle only if a valid EdDSA public key is configured
         if let edKey = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String,
@@ -80,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        sessionsWindow.persistOpenState()
         monitor.stop()
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
@@ -246,14 +258,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 context.setBlendMode(.normal)
 
                 let dotColor: NSColor = switch state {
-                case .waiting: .systemOrange
+                case .waiting: .systemRed
                 case .active: .systemGreen
                 case .compacting: .systemBlue
                 case .idle: .systemGray
                 }
 
-                dotColor.setFill()
-                NSBezierPath(ovalIn: dotRect).fill()
+                let dotPath = NSBezierPath(ovalIn: dotRect)
+                if state == .idle {
+                    // Idle: hollow ring, so it visibly recedes vs the filled
+                    // dots used for any "real" state.
+                    dotColor.withAlphaComponent(0.6).setStroke()
+                    dotPath.lineWidth = 1.5
+                    dotPath.stroke()
+                } else {
+                    dotColor.setFill()
+                    dotPath.fill()
+                    // Waiting: overlay a "?" so it's distinguishable even at a
+                    // glance / for people who can't easily tell red from orange.
+                    if state == .waiting {
+                        let mark = "?" as NSString
+                        let attrs: [NSAttributedString.Key: Any] = [
+                            .font: NSFont.boldSystemFont(ofSize: 8),
+                            .foregroundColor: NSColor.white,
+                        ]
+                        let markSize = mark.size(withAttributes: attrs)
+                        let markRect = NSRect(
+                            x: dotRect.midX - markSize.width / 2,
+                            y: dotRect.midY - markSize.height / 2 - 0.5,
+                            width: markSize.width,
+                            height: markSize.height
+                        )
+                        mark.draw(in: markRect, withAttributes: attrs)
+                    }
+                }
 
                 // Draw exclamation mark overlay when hook is missing
                 if hookMissing {
@@ -289,6 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hostingController = NSHostingController(
             rootView: PopoverContentView(
                 monitor: monitor,
+                profileStore: profileStore,
                 onSessionTap: { [weak self] session in
                     self?.closePopover()
                     self?.focuser.focus(session: session)
@@ -300,6 +339,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.closePopover()
                     self?.showSettings()
                 },
+                onOpenWindow: { [weak self] in
+                    self?.closePopover()
+                    self?.sessionsWindow.show()
+                },
                 onQuit: {
                     NSApplication.shared.terminate(nil)
                 }
@@ -307,6 +350,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         hostingController.sizingOptions = [.preferredContentSize, .intrinsicContentSize]
         popover.contentViewController = hostingController
+    }
+
+    // MARK: - Notifications
+
+    private func setupNotifications() {
+        // Resolve deep links by ID so the notification tap can focus the right session.
+        notificationManager.deepLinkURLForSessionId = { [weak self] sessionId in
+            guard let self,
+                  let session = self.monitor.sessions.first(where: { $0.id == sessionId }) else {
+                return nil
+            }
+            return session.deepLinkURL
+        }
+
+        // Forward state transitions from the monitor.
+        monitor.onStateTransition = { [weak self] transition in
+            self?.notificationManager.handle(transition: transition)
+        }
+
+        if notificationManager.isEnabled {
+            notificationManager.requestAuthorizationIfNeeded()
+        }
     }
 
     @objc private func togglePopover() {
@@ -334,79 +399,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let pluginPromptShownKey = "pluginInstallPromptShown"
 
     private func checkPluginInstallation() {
-        let detector = PluginDetector()
-        let state = detector.detect()
+        var profilesMissingPlugin: [ClaudeProfile] = []
 
-        if state == .installed {
-            // Check if the installed version matches the bundled version
-            checkPluginVersionAndUpdate(detector: detector)
-            return
+        for profile in profileStore.profiles {
+            let detector = PluginDetector(profile: profile)
+            switch detector.detect() {
+            case .installed:
+                checkPluginVersionAndUpdate(detector: detector, profile: profile)
+            case .notInstalled:
+                profilesMissingPlugin.append(profile)
+            case .unknown:
+                continue
+            }
         }
 
-        guard state == .notInstalled else { return }
+        guard !profilesMissingPlugin.isEmpty else { return }
 
-        // Only show the dialog once per app version to avoid nagging
+        // Only show the install dialog once per app version to avoid nagging.
         let lastPromptVersion = UserDefaults.standard.string(forKey: Self.pluginPromptShownKey)
         let currentVersion = Bundle.main.appVersion
         if lastPromptVersion == currentVersion { return }
 
         UserDefaults.standard.set(currentVersion, forKey: Self.pluginPromptShownKey)
-        showPluginInstallDialog()
+        showPluginInstallDialog(for: profilesMissingPlugin)
     }
 
-    /// Removes the plugin if the installed version doesn't match the bundled version,
-    /// then prompts the user to install the updated version.
-    private func checkPluginVersionAndUpdate(detector: PluginDetector) {
+    /// Removes the plugin from the given profile if the installed version doesn't match the
+    /// bundled version, then prompts the user to install the updated version into that profile.
+    private func checkPluginVersionAndUpdate(detector: PluginDetector, profile: ClaudeProfile) {
         guard let bundledVersion = pluginInstaller.bundledPluginVersion,
               let installedVersion = detector.installedPluginVersion(),
               bundledVersion != installedVersion else {
             return
         }
 
-        // Version mismatch — remove the old plugin on a background queue,
-        // then prompt for reinstall on the main thread
         let installer = pluginInstaller
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            if let error = installer.uninstall() {
+            if let error = installer.uninstall(profile: profile) {
                 NSLog("Claude Status: plugin removal failed during version check: %@", error)
                 DispatchQueue.main.async {
                     let alert = NSAlert()
                     alert.messageText = "Plugin Update Failed"
-                    alert.informativeText = "Could not remove the outdated plugin (v\(installedVersion)): \(error)\n\nYou can try removing it manually from Settings."
+                    alert.informativeText = "Could not remove the outdated plugin (v\(installedVersion)) for profile \"\(profile.name)\": \(error)\n\nYou can try removing it manually from Settings."
                     alert.alertStyle = .warning
                     alert.runModal()
                 }
                 return
             }
-            NSLog("Claude Status: removed outdated plugin v%@ (bundled v%@)",
-                  installedVersion, bundledVersion)
+            NSLog("Claude Status: removed outdated plugin v%@ (bundled v%@) for profile %@",
+                  installedVersion, bundledVersion, profile.name)
             DispatchQueue.main.async {
                 self?.monitor.invalidatePluginCache()
                 self?.monitor.refresh()
-                self?.showPluginInstallDialog()
+                self?.showPluginInstallDialog(for: [profile])
             }
         }
     }
 
-    private func showPluginInstallDialog() {
+    private func showPluginInstallDialog(for profiles: [ClaudeProfile]) {
+        guard !profiles.isEmpty else { return }
         let alert = NSAlert()
-        alert.messageText = "Install Claude Code Plugin?"
-        alert.informativeText = "Claude Status requires a Claude Code plugin to report session activity. The plugin registers lightweight hooks that write status files as Claude works.\n\nYou can also install it later from the status menu."
+        if profiles.count == 1 {
+            let profile = profiles[0]
+            alert.messageText = "Install Claude Code Plugin in \"\(profile.name)\"?"
+            alert.informativeText = "Claude Status requires a Claude Code plugin in each profile to report session activity. The plugin registers lightweight hooks that write status files as Claude works.\n\nYou can also install it later from Settings."
+        } else {
+            let names = profiles.map(\.name).joined(separator: ", ")
+            alert.messageText = "Install Claude Code Plugin in \(profiles.count) profiles?"
+            alert.informativeText = "The Claude Status plugin is missing in: \(names).\n\nIt registers lightweight hooks that write status files as Claude works. You can also install it later from Settings."
+        }
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Install Plugin")
+        alert.addButton(withTitle: profiles.count == 1 ? "Install Plugin" : "Install in All")
         alert.addButton(withTitle: "Not Now")
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
-            performPluginInstall()
+            for profile in profiles {
+                performPluginInstall(for: profile, showSuccessAlert: profiles.count == 1)
+            }
+            if profiles.count > 1 {
+                let success = NSAlert()
+                success.messageText = "Plugin Installed"
+                success.informativeText = "The Claude Status plugin was installed in all selected profiles."
+                success.alertStyle = .informational
+                success.runModal()
+            }
         }
     }
 
-    func performPluginUninstall() {
-        if let error = pluginInstaller.uninstall() {
+    func performPluginUninstall(for profile: ClaudeProfile) {
+        if let error = pluginInstaller.uninstall(profile: profile) {
             let errorAlert = NSAlert()
             errorAlert.messageText = "Plugin Uninstall Failed"
-            errorAlert.informativeText = error
+            errorAlert.informativeText = "\(profile.name): \(error)"
             errorAlert.alertStyle = .warning
             errorAlert.runModal()
         } else {
@@ -415,17 +500,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let successAlert = NSAlert()
             successAlert.messageText = "Plugin Uninstalled"
-            successAlert.informativeText = "The Claude Status plugin has been removed. Session activity will no longer be reported."
+            successAlert.informativeText = "The Claude Status plugin has been removed from \"\(profile.name)\". Session activity in that profile will no longer be reported."
             successAlert.alertStyle = .informational
             successAlert.runModal()
         }
     }
 
-    func performPluginInstall() {
-        if let error = pluginInstaller.install() {
+    func performPluginInstall(for profile: ClaudeProfile, showSuccessAlert: Bool = true) {
+        if let error = pluginInstaller.install(profile: profile) {
             let errorAlert = NSAlert()
             errorAlert.messageText = "Plugin Installation Failed"
-            errorAlert.informativeText = error
+            errorAlert.informativeText = "\(profile.name): \(error)"
             errorAlert.alertStyle = .warning
             errorAlert.runModal()
         } else {
@@ -433,11 +518,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             monitor.invalidatePluginCache()
             monitor.refresh()
 
-            let successAlert = NSAlert()
-            successAlert.messageText = "Plugin Installed"
-            successAlert.informativeText = "The Claude Status plugin has been installed. It will activate the next time a Claude Code session starts."
-            successAlert.alertStyle = .informational
-            successAlert.runModal()
+            if showSuccessAlert {
+                let successAlert = NSAlert()
+                successAlert.messageText = "Plugin Installed"
+                successAlert.informativeText = "The Claude Status plugin has been installed in \"\(profile.name)\". It will activate the next time a Claude Code session starts."
+                successAlert.alertStyle = .informational
+                successAlert.runModal()
+            }
         }
     }
 
@@ -450,18 +537,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let pluginState = PluginDetector().detect()
         let settingsView = SettingsView(
-            pluginState: pluginState,
+            profileStore: profileStore,
             updater: updaterController?.updater,
-            onInstallPlugin: { [weak self] in
-                self?.performPluginInstall()
-                // Reopen settings to reflect new state
+            pluginState: { profile in
+                PluginDetector(profile: profile).detect()
+            },
+            onInstallPlugin: { [weak self] profile in
+                self?.performPluginInstall(for: profile)
                 self?.settingsWindow?.close()
                 self?.showSettings()
             },
-            onUninstallPlugin: { [weak self] in
-                self?.performPluginUninstall()
+            onUninstallPlugin: { [weak self] profile in
+                self?.performPluginUninstall(for: profile)
                 self?.settingsWindow?.close()
                 self?.showSettings()
             }
@@ -544,18 +632,23 @@ private extension NSImage {
 /// SwiftUI wrapper that observes the monitor for the popover.
 private struct PopoverContentView: View {
     @Bindable var monitor: SessionMonitor
+    @Bindable var profileStore: ProfileStore
     var onSessionTap: (ClaudeSession) -> Void
     var onRefresh: () -> Void
     var onSettings: () -> Void
+    var onOpenWindow: () -> Void
     var onQuit: () -> Void
 
     var body: some View {
         SessionListView(
             sessions: monitor.sessions,
             productivityData: monitor.productivityData,
+            profileNames: Dictionary(uniqueKeysWithValues: profileStore.profiles.map { ($0.id, $0.name) }),
+            presentation: .popover,
             onSessionTap: onSessionTap,
             onRefresh: onRefresh,
             onSettings: onSettings,
+            onOpenWindow: onOpenWindow,
             onQuit: onQuit
         )
     }
