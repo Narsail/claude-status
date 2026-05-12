@@ -113,6 +113,14 @@ struct TranscriptSummary: Codable, Equatable {
     let timestamp: Date
 }
 
+/// Describes a subagent (`Task`/`Agent` tool) the parent session has
+/// dispatched but which hasn't returned yet. Lets discovery promote a
+/// session's state to active even when the hook hasn't fired.
+struct InFlightSubagentInfo: Equatable {
+    let description: String
+    let dispatchedAt: Date
+}
+
 /// A discovered Claude Code session on the local machine.
 struct ClaudeSession: Identifiable, Codable, Equatable {
     /// The session UUID from Claude Code (stable across refreshes).

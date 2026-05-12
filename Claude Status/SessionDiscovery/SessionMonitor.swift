@@ -79,6 +79,10 @@ final class SessionMonitor {
             resolver.latestRecapSummary(sessionId: sessionId, in: projectDir)
                 .map { TranscriptSummary(text: $0.text, timestamp: $0.timestamp) }
         }
+        self.discovery.subagentResolver = { sessionId, projectDir in
+            resolver.inFlightSubagent(sessionId: sessionId, in: projectDir)
+                .map { InFlightSubagentInfo(description: $0.description, dispatchedAt: $0.dispatchedAt) }
+        }
     }
 
     deinit {

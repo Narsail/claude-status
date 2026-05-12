@@ -69,6 +69,88 @@ final class StateResolver {
         return summaryFromLastMeaningfulLine(of: jsonlURL)
     }
 
+    /// Information about a subagent (`Task`/`Agent` tool) that was dispatched
+    /// from the parent session and hasn't returned yet.
+    struct InFlightSubagent: Equatable {
+        let description: String
+        /// Timestamp of the assistant turn that dispatched the subagent.
+        let dispatchedAt: Date
+    }
+
+    /// Scans the JSONL tail for a `Task`/`Agent` `tool_use` whose matching
+    /// `tool_result` hasn't appeared yet. The hook script doesn't fire on
+    /// tool use, so without this check a session with a long-running subagent
+    /// looks "idle" to the rest of the app — JSONL silence on the parent.
+    func inFlightSubagent(sessionId: String, in projectDir: URL) -> InFlightSubagent? {
+        let jsonlURL = projectDir.appendingPathComponent("\(sessionId).jsonl")
+        guard let handle = try? FileHandle(forReadingFrom: jsonlURL) else { return nil }
+        defer { try? handle.close() }
+
+        let fileSize: UInt64
+        do { fileSize = try handle.seekToEnd() } catch { return nil }
+        // 256KB tail is enough — a subagent dispatch and its result span a
+        // small number of entries; nothing useful sits further back.
+        let tailSize: UInt64 = min(fileSize, 256 * 1024)
+        guard tailSize > 0 else { return nil }
+        let seekPos = fileSize - tailSize
+        do { try handle.seek(toOffset: seekPos) } catch { return nil }
+
+        guard let data = try? handle.read(upToCount: Int(tailSize)),
+              let tail = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        // First pass: collect every tool_use_id that already has a tool_result.
+        // Walk forward — partial first line is OK to skip, we only care about
+        // matching IDs.
+        var resolvedIds = Set<String>()
+        var dispatches: [(id: String, description: String, timestamp: Date)] = []
+
+        for line in tail.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let jsonData = line.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let entryType = json["type"] as? String,
+                  let message = json["message"] as? [String: Any],
+                  let content = message["content"] as? [[String: Any]] else {
+                continue
+            }
+
+            for block in content {
+                guard let blockType = block["type"] as? String else { continue }
+                switch (entryType, blockType) {
+                case ("user", "tool_result"):
+                    if let id = block["tool_use_id"] as? String {
+                        resolvedIds.insert(id)
+                    }
+                case ("assistant", "tool_use"):
+                    let name = block["name"] as? String ?? ""
+                    guard name == "Task" || name == "Agent",
+                          let id = block["id"] as? String else {
+                        continue
+                    }
+                    let input = block["input"] as? [String: Any] ?? [:]
+                    let desc = (input["description"] as? String)
+                        ?? (input["prompt"] as? String)
+                        ?? "subagent"
+                    let ts = (json["timestamp"] as? String).flatMap(Self.transcriptDate(from:))
+                        ?? Date()
+                    dispatches.append((id: id, description: desc, timestamp: ts))
+                default:
+                    continue
+                }
+            }
+        }
+
+        // Most recent unresolved Task wins — that's the active subagent.
+        for dispatch in dispatches.reversed() where !resolvedIds.contains(dispatch.id) {
+            return InFlightSubagent(
+                description: dispatch.description,
+                dispatchedAt: dispatch.timestamp
+            )
+        }
+        return nil
+    }
+
     /// Returns the most recent `away_summary` system entry in the session's
     /// JSONL transcript — the short "Goal / Current task / Next" recap line
     /// Claude Code surfaces between turns. Returns nil when none exists yet.

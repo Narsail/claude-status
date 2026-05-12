@@ -165,7 +165,7 @@ struct SessionDiscovery {
 
         let ppidValue = json["ppid"] as? Int ?? 0
 
-        let state: SessionState
+        var state: SessionState
         switch stateString {
         case "active": state = .active
         case "waiting": state = .waiting
@@ -173,13 +173,24 @@ struct SessionDiscovery {
         default: state = .idle
         }
 
-        let activity = json["activity"] as? String ?? ""
+        var activity = json["activity"] as? String ?? ""
 
         let timestamp = Self.iso8601Formatter.date(from: timestampString) ?? Date()
 
         let cwd = json["cwd"] as? String ?? ""
         let event = json["event"] as? String ?? ""
         let sessionName = json["session_name"] as? String
+
+        // Plugin bug workaround: slash commands like `/clear` cause the hook
+        // to write `event:"system:local_command"` with whatever state Claude
+        // Code happened to report (often "active"/"thinking"). The plugin
+        // never updates the file again until the next real turn, so the
+        // session looks permanently active. Override to idle for these — a
+        // genuine following turn will overwrite with a correct event.
+        if event == "system:local_command" {
+            state = .idle
+            activity = ""
+        }
 
         return CStatusRecord(
             sessionId: sessionId,
@@ -231,21 +242,35 @@ struct SessionDiscovery {
             tmuxSocket = nil
         }
 
+        // Subagent override: if the parent transcript shows a Task/Agent
+        // tool_use without a matching tool_result, the session is actually
+        // working — the hook just doesn't fire on tool use, so .cstatus may
+        // still report idle/waiting from the previous turn.
+        var state = record.state
+        var activity = record.activity
+        var lastAction = lastActionResolver?(record.sessionId, record.projectDir)
+        if let subagent = subagentResolver?(record.sessionId, record.projectDir) {
+            state = .active
+            let label = "Agent: \(subagent.description)"
+            activity = label
+            lastAction = TranscriptSummary(text: label, timestamp: subagent.dispatchedAt)
+        }
+
         return ClaudeSession(
             sessionId: record.sessionId,
             pid: record.pid,
             workingDirectory: record.cwd,
             projectName: projectName,
-            state: record.state,
+            state: state,
             lastActivityAt: record.timestamp,
             iTermSessionId: iTermSessionId,
             tmuxPaneId: tmuxPaneId,
             tmuxSocket: tmuxSocket,
             source: source,
-            activity: record.activity,
+            activity: activity,
             sessionName: record.sessionName,
             profileId: record.profileId,
-            lastAction: lastActionResolver?(record.sessionId, record.projectDir),
+            lastAction: lastAction,
             recapIntent: recapResolver?(record.sessionId, record.projectDir)
         )
     }
@@ -257,6 +282,10 @@ struct SessionDiscovery {
     /// Closure that extracts the most recent auto-compaction recap. Same
     /// reasoning as `lastActionResolver` — parsing lives in `StateResolver`.
     var recapResolver: ((String, URL) -> TranscriptSummary?)?
+    /// Closure that detects an in-flight subagent. When non-nil, the session
+    /// is force-promoted to `.active` because the hook doesn't fire on tool
+    /// dispatch.
+    var subagentResolver: ((String, URL) -> InFlightSubagentInfo?)?
 
     // MARK: - Process Validation
 
